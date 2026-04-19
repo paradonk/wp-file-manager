@@ -1,0 +1,232 @@
+<?php
+/**
+ * Self-hosted automatic updater for the File Manager plugin.
+ *
+ * Hooks into WordPress's native update pipeline. No external dependencies.
+ * Checks a remote JSON file every 12 hours and surfaces any new version on
+ * the Plugins page exactly like a wordpress.org plugin update.
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+class DFM_Updater {
+
+    /** Absolute path to the main plugin file (file-manager.php). */
+    private $plugin_file;
+
+    /** Plugin slug — matches the plugin folder name: "file-manager". */
+    private $plugin_slug;
+
+    /** Currently installed version string. */
+    private $version;
+
+    /** Full URL to the remote JSON metadata file. */
+    private $update_url;
+
+    /** Transient key used to cache the remote response. */
+    private $cache_key = 'dfm_remote_update_info';
+
+    /** How long to cache the remote response, in seconds (12 hours). */
+    private $cache_ttl = 43200;
+
+    /**
+     * @param string $plugin_file  Absolute path to the plugin's main file (__FILE__).
+     * @param string $version      Current plugin version (e.g. "1.0.0").
+     * @param string $update_url   URL to the remote JSON metadata file.
+     */
+    public function __construct( $plugin_file, $version, $update_url ) {
+        $this->plugin_file = $plugin_file;
+        $this->plugin_slug = dirname( plugin_basename( $plugin_file ) ); // "file-manager"
+        $this->version     = $version;
+        $this->update_url  = $update_url;
+
+        // Inject update data into WordPress's update-check transient.
+        add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_for_update' ) );
+
+        // Supply plugin detail data for the "View version x.x.x details" popup.
+        add_filter( 'plugins_api', array( $this, 'plugin_info' ), 20, 3 );
+
+        // Clear our cached remote data after a successful update.
+        add_action( 'upgrader_process_complete', array( $this, 'clear_cache_after_update' ), 10, 2 );
+    }
+
+    // -------------------------------------------------------------------------
+    // Remote metadata
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fetch (and cache) the remote JSON metadata.
+     *
+     * @return object|false Decoded JSON object, or false on failure.
+     */
+    private function get_remote_info() {
+        $cached = get_transient( $this->cache_key );
+        if ( false !== $cached ) {
+            return $cached;
+        }
+
+        $response = wp_remote_get(
+            $this->update_url,
+            array(
+                'timeout' => 10,
+                'headers' => array( 'Accept' => 'application/json' ),
+            )
+        );
+
+        if ( is_wp_error( $response ) ) {
+            return false;
+        }
+
+        if ( 200 !== wp_remote_retrieve_response_code( $response ) ) {
+            return false;
+        }
+
+        $data = json_decode( wp_remote_retrieve_body( $response ) );
+
+        if ( empty( $data ) || ! isset( $data->version ) || ! isset( $data->download_url ) ) {
+            return false;
+        }
+
+        set_transient( $this->cache_key, $data, $this->cache_ttl );
+        return $data;
+    }
+
+    // -------------------------------------------------------------------------
+    // WordPress hooks
+    // -------------------------------------------------------------------------
+
+    /**
+     * Filter: pre_set_site_transient_update_plugins
+     *
+     * Called whenever WordPress refreshes its plugin update transient.
+     * If a newer version exists remotely, we inject an update record so
+     * WordPress shows the "Update now" link on the Plugins page.
+     *
+     * @param  object $transient The existing update_plugins transient value.
+     * @return object            Possibly modified transient.
+     */
+    public function check_for_update( $transient ) {
+        if ( empty( $transient->checked ) ) {
+            return $transient;
+        }
+
+        $info = $this->get_remote_info();
+        if ( ! $info ) {
+            return $transient;
+        }
+
+        $plugin_basename = plugin_basename( $this->plugin_file ); // "file-manager/file-manager.php"
+
+        if ( version_compare( $this->version, $info->version, '<' ) ) {
+            // A newer version is available — tell WordPress about it.
+            $transient->response[ $plugin_basename ] = (object) array(
+                'id'            => $this->plugin_slug . '/' . $this->plugin_slug . '.php',
+                'slug'          => $this->plugin_slug,
+                'plugin'        => $plugin_basename,
+                'new_version'   => $info->version,
+                'url'           => isset( $info->author_profile ) ? $info->author_profile : '',
+                'package'       => $info->download_url,  // URL to the installable ZIP.
+                'icons'         => array(),
+                'banners'       => array(),
+                'banners_rtl'   => array(),
+                'tested'        => isset( $info->tested )       ? $info->tested       : '',
+                'requires_php'  => isset( $info->requires_php ) ? $info->requires_php : '',
+                'compatibility' => new stdClass(),
+            );
+
+            // Remove from no_update list in case it was there.
+            unset( $transient->no_update[ $plugin_basename ] );
+
+        } else {
+            // Plugin is up to date — register it so the "up to date" notice works.
+            if ( ! isset( $transient->response[ $plugin_basename ] ) ) {
+                $transient->no_update[ $plugin_basename ] = (object) array(
+                    'id'            => $this->plugin_slug . '/' . $this->plugin_slug . '.php',
+                    'slug'          => $this->plugin_slug,
+                    'plugin'        => $plugin_basename,
+                    'new_version'   => $this->version,
+                    'url'           => '',
+                    'package'       => '',
+                    'icons'         => array(),
+                    'banners'       => array(),
+                    'banners_rtl'   => array(),
+                );
+            }
+        }
+
+        return $transient;
+    }
+
+    /**
+     * Filter: plugins_api
+     *
+     * Provides plugin metadata for the "View version x.x.x details" modal
+     * that appears when an admin clicks the version link on the Plugins page.
+     *
+     * @param  false|object $result  Existing result (false means "not handled yet").
+     * @param  string       $action  API action being requested.
+     * @param  object       $args    Arguments for the API call.
+     * @return false|object          Our plugin info, or the original $result.
+     */
+    public function plugin_info( $result, $action, $args ) {
+        if ( 'plugin_information' !== $action ) {
+            return $result;
+        }
+
+        if ( ! isset( $args->slug ) || $args->slug !== $this->plugin_slug ) {
+            return $result;
+        }
+
+        $info = $this->get_remote_info();
+        if ( ! $info ) {
+            return $result;
+        }
+
+        return (object) array(
+            'name'           => isset( $info->name )           ? $info->name           : '',
+            'slug'           => $this->plugin_slug,
+            'version'        => $info->version,
+            'author'         => isset( $info->author )         ? $info->author         : '',
+            'author_profile' => isset( $info->author_profile ) ? $info->author_profile : '',
+            'requires'       => isset( $info->requires )       ? $info->requires       : '',
+            'tested'         => isset( $info->tested )         ? $info->tested         : '',
+            'requires_php'   => isset( $info->requires_php )   ? $info->requires_php   : '',
+            'download_link'  => $info->download_url,
+            'trunk'          => $info->download_url,
+            'last_updated'   => isset( $info->last_updated )   ? $info->last_updated   : '',
+            'sections'       => isset( $info->sections )       ? (array) $info->sections : array(
+                'description' => isset( $info->description ) ? $info->description : '',
+            ),
+            'banners'        => isset( $info->banners )        ? (array) $info->banners  : array(),
+        );
+    }
+
+    /**
+     * Action: upgrader_process_complete
+     *
+     * Deletes our cached remote info after this plugin is updated so that
+     * the next page load fetches fresh data rather than a stale version string.
+     *
+     * @param WP_Upgrader $upgrader Upgrader instance.
+     * @param array       $options  Array of bulk item/action data.
+     */
+    public function clear_cache_after_update( $upgrader, $options ) {
+        if (
+            'update' !== $options['action'] ||
+            'plugin' !== $options['type']   ||
+            empty( $options['plugins'] )
+        ) {
+            return;
+        }
+
+        $plugin_basename = plugin_basename( $this->plugin_file );
+        foreach ( $options['plugins'] as $updated_plugin ) {
+            if ( $updated_plugin === $plugin_basename ) {
+                delete_transient( $this->cache_key );
+                break;
+            }
+        }
+    }
+}
