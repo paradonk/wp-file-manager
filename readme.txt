@@ -1,5 +1,5 @@
 === File Manager ===
-Contributors: developer
+Contributors: Paradorn Katananon
 Tags: file manager, uploads, media, files, folders
 Requires at least: 5.0
 Tested up to: 6.9.4
